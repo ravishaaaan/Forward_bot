@@ -31,6 +31,23 @@ OWNER_CHAT_ID = os.environ.get('OWNER_CHAT_ID', 'owner_chat_id')
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
+# Full guide message to show when asking for caption or poll
+GUIDE_TEXT = (
+    "Send me the caption or poll.\n\n"
+    "To add a caption:\n"
+    "- Just type the caption text and send it.\n\n"
+    "To create a poll:\n"
+    "- Start your message with /poll followed by the question and each option separated by a vertical bar |.\n"
+    "- Format: /poll Question|Option 1|Option 2|Option 3\n"
+    "- Example: /poll Which color do you prefer?|Red|Blue|Green\n\n"
+    "Important:\n"
+    "- Polls must have at least 2 options (and up to 10).\n"
+    "- The first item after /poll is the poll question; the remaining items are the options.\n"
+    "- Avoid using | inside option text (use it only as the separator).\n\n"
+    "After you send the caption or /poll message the bot will preview the photo with your caption or poll.\n"
+    "Tap Confirm to forward it for approval, or New Input to change it."
+)
+
 def validate_config():
     missing = []
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
@@ -104,7 +121,7 @@ def button(update: Update, context: CallbackContext) -> None:
 
     if data == 'add_caption_poll':
         logger.info('button: user chose to add caption/poll')
-        safe_edit_or_reply(query, "Send me the caption or poll.")
+        safe_edit_or_reply(query, GUIDE_TEXT)
         return
 
     if data == 'no_caption_poll':
@@ -159,7 +176,7 @@ def button(update: Update, context: CallbackContext) -> None:
 
     if data == 'new_input':
         logger.info('button: received new_input')
-        safe_edit_or_reply(query, "Send me the new caption or poll.")
+        safe_edit_or_reply(query, GUIDE_TEXT)
         return
 
     if data == 'approve':
