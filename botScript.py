@@ -13,6 +13,7 @@ from telegram import error as tg_error
 from uuid import uuid4
 import threading
 import re
+import time
 
 # In-memory store for pending approvals: approval_id -> {file_ids, caption, poll}
 APPROVALS = {}
@@ -462,6 +463,10 @@ def button(update: Update, context: CallbackContext) -> None:
 
 def handle_caption_poll(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER handle_caption_poll: called by user=%s', update.effective_user and update.effective_user.id)
+    # Some updates may be commands delivered without a message body; guard against None
+    if not update or not getattr(update, 'message', None) or not getattr(update.message, 'text', None):
+        logger.warning('handle_caption_poll: no message text found in update; ignoring')
+        return
     user_input = update.message.text
     logger.info('handle_caption_poll: user_input=%s', user_input)
     # First check for album in user_data
@@ -625,10 +630,18 @@ def forward_to_channel(context: CallbackContext, file_id_or_list, caption: str =
             logger.exception('forward_to_channel: failed to send media_group: %s', e)
         # If there's a poll, send it after the album
         if poll_question and poll_options:
-            try:
-                context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
-            except Exception as e:
-                logger.exception('forward_to_channel: failed to send poll for album: %s', e)
+            # Retry sending poll a few times in case of transient network/read timeouts
+            for attempt in range(3):
+                try:
+                    context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
+                    break
+                except tg_error.TimedOut:
+                    logger.warning('forward_to_channel: send_poll timed out (attempt %d), retrying...', attempt + 1)
+                    time.sleep(1)
+                    continue
+                except Exception as e:
+                    logger.exception('forward_to_channel: failed to send poll for album: %s', e)
+                    break
         return
 
     # Single photo path
@@ -638,10 +651,18 @@ def forward_to_channel(context: CallbackContext, file_id_or_list, caption: str =
             context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=caption)
         except Exception as e:
             logger.exception('forward_to_channel: failed to send photo before poll: %s', e)
-        try:
-            context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
-        except Exception as e:
-            logger.exception('forward_to_channel: failed to send poll: %s', e)
+        # Retry sending poll a few times for transient errors
+        for attempt in range(3):
+            try:
+                context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
+                break
+            except tg_error.TimedOut:
+                logger.warning('forward_to_channel: send_poll timed out (attempt %d), retrying...', attempt + 1)
+                time.sleep(1)
+                continue
+            except Exception as e:
+                logger.exception('forward_to_channel: failed to send poll: %s', e)
+                break
         return
 
     # Simple single photo with optional caption
@@ -654,7 +675,8 @@ def main() -> None:
     # Validate config and create the Updater using the token from the environment
     validate_config()
     # Create the Updater and pass it your bot's token.
-    updater = Updater(TELEGRAM_BOT_TOKEN)
+    # Increase read_timeout to reduce transient ReadTimeout errors when sending polls/media
+    updater = Updater(TELEGRAM_BOT_TOKEN, request_kwargs={'read_timeout': 15, 'connect_timeout': 10})
 
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
