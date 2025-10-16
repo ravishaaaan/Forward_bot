@@ -12,6 +12,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackContex
 from telegram import error as tg_error
 from uuid import uuid4
 import threading
+import re
 
 # In-memory store for pending approvals: approval_id -> {file_ids, caption, poll}
 APPROVALS = {}
@@ -67,6 +68,32 @@ def validate_config():
         print('Missing or placeholder configuration for:', ', '.join(missing))
         print('Please update the .env file or set environment variables. See README.md for details.')
         sys.exit(1)
+
+
+def parse_poll(text: str):
+    """Parse a /poll command and return (question, [options]) or None if invalid.
+
+    Accepts formats like:
+      /poll Question|Opt1|Opt2
+      /poll@botname Question|Opt1|Opt2
+      /poll    Question|Opt1|Opt2 (extra spaces)
+    """
+    if not text:
+        return None
+    m = re.match(r'^/poll(?:@\S+)?\s*(.*)$', text.strip(), flags=re.I)
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if not rest:
+        return None
+    parts = [p.strip() for p in rest.split('|')]
+    if len(parts) < 2:
+        return None
+    question = parts[0]
+    options = [p for p in parts[1:] if p]
+    if len(options) < 2:
+        return None
+    return question, options
 
 
 def safe_edit_or_reply(query, text: str):
@@ -275,6 +302,9 @@ def button(update: Update, context: CallbackContext) -> None:
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            # clear user_data for this user
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Album forwarded to the channel for approval.")
             return
 
@@ -290,6 +320,8 @@ def button(update: Update, context: CallbackContext) -> None:
                      InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption='Approval request', reply_markup=reply_markup)
+        for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+            context.user_data.pop(k, None)
         safe_edit_or_reply(query, "Image forwarded to the channel for approval.")
         return
 
@@ -317,6 +349,9 @@ def button(update: Update, context: CallbackContext) -> None:
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            # clear user_data
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Album with caption forwarded to the channel for approval.")
             return
 
@@ -330,6 +365,8 @@ def button(update: Update, context: CallbackContext) -> None:
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=caption, reply_markup=reply_markup)
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Image with caption forwarded to the channel for approval.")
         return
 
@@ -357,6 +394,8 @@ def button(update: Update, context: CallbackContext) -> None:
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album (poll)', reply_markup=reply_markup)
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Album with poll forwarded to the channel for approval.")
             return
 
@@ -371,6 +410,8 @@ def button(update: Update, context: CallbackContext) -> None:
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=poll_question, reply_markup=reply_markup)
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Image with poll forwarded to the channel for approval.")
         return
 
@@ -423,36 +464,131 @@ def handle_caption_poll(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER handle_caption_poll: called by user=%s', update.effective_user and update.effective_user.id)
     user_input = update.message.text
     logger.info('handle_caption_poll: user_input=%s', user_input)
-    if 'image_file_id' in context.user_data:
-        file_id = context.user_data['image_file_id']
-        # Check if the input is a poll or a caption
-        if user_input.startswith('/poll '):
-            poll_options = user_input[len('/poll '):].split('|')
+    # First check for album in user_data
+    if 'image_file_ids' in context.user_data:
+        file_ids = context.user_data['image_file_ids']
+        # Use parse_poll which handles variations of /poll command more robustly
+        parsed = parse_poll(user_input)
+        if parsed:
+            poll_question, poll_options = parsed
             if len(poll_options) < 2:
                 update.message.reply_text('Please provide at least two options for the poll, separated by |.')
                 return
-            poll_question = poll_options[0]
-            poll_options = poll_options[1:]
+            logger.info('handle_caption_poll: sending album preview with parsed poll question')
+            media = []
+            for i, fid in enumerate(file_ids):
+                if i == 0:
+                    media.append(InputMediaPhoto(media=fid, caption=poll_question))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            try:
+                context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+            except Exception as e:
+                logger.exception('handle_caption_poll: failed to send album preview: %s', e)
+            # store parsed poll into user_data and send confirmation keyboard
+            context.user_data['poll_options'] = poll_options
+            context.user_data['poll_question'] = poll_question
             keyboard = [[InlineKeyboardButton("Confirm", callback_data='confirm_poll'),
                          InlineKeyboardButton("New Input", callback_data='new_input')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            logger.info('handle_caption_poll: sending photo preview with poll question')
-            context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=poll_question, reply_markup=reply_markup)
-            context.user_data['poll_options'] = poll_options
-            context.user_data['poll_question'] = poll_question
-        else:
-            keyboard = [[InlineKeyboardButton("Confirm", callback_data='confirm_caption'),
+            try:
+                context.bot.send_message(chat_id=update.effective_chat.id, text='Preview: album with poll. Confirm or provide new input.', reply_markup=reply_markup)
+            except Exception:
+                # fallback to safe edit style reply
+                update.message.reply_text('Preview: album with poll. Confirm or provide new input.')
+            return
+
+        # Treat as caption
+        logger.info('handle_caption_poll: sending album preview with caption')
+        media = []
+        for i, fid in enumerate(file_ids):
+            if i == 0:
+                media.append(InputMediaPhoto(media=fid, caption=user_input))
+            else:
+                media.append(InputMediaPhoto(media=fid))
+        try:
+            context.bot.send_media_group(chat_id=update.effective_chat.id, media=media)
+        except Exception as e:
+            logger.exception('handle_caption_poll: failed to send album preview: %s', e)
+        context.user_data['caption'] = user_input
+        keyboard = [[InlineKeyboardButton("Confirm", callback_data='confirm_caption'),
+                     InlineKeyboardButton("New Input", callback_data='new_input')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            context.bot.send_message(chat_id=update.effective_chat.id, text='Preview: album caption. Confirm or provide new input.', reply_markup=reply_markup)
+        except Exception:
+            update.message.reply_text('Preview: album caption. Confirm or provide new input.')
+        return
+
+    # Fallback: single-image flow
+    if 'image_file_id' in context.user_data:
+        file_id = context.user_data['image_file_id']
+        # Use parse_poll for single-image poll parsing as well
+        parsed = parse_poll(user_input)
+        if parsed:
+            poll_question, poll_options = parsed
+            if len(poll_options) < 2:
+                update.message.reply_text('Please provide at least two options for the poll, separated by |.')
+                return
+            keyboard = [[InlineKeyboardButton("Confirm", callback_data='confirm_poll'),
                          InlineKeyboardButton("New Input", callback_data='new_input')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            logger.info('handle_caption_poll: sending photo preview with caption')
-            context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=user_input, reply_markup=reply_markup)
-            context.user_data['caption'] = user_input
+            logger.info('handle_caption_poll: sending photo preview with parsed poll question')
+            try:
+                context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=poll_question)
+            except Exception as e:
+                logger.exception('handle_caption_poll: failed to send photo preview with poll question: %s', e)
+            # store poll details and send explicit confirm/new input keyboard
+            context.user_data['poll_options'] = poll_options
+            context.user_data['poll_question'] = poll_question
+            try:
+                context.bot.send_message(chat_id=update.effective_chat.id, text='Preview: photo with poll. Confirm or provide new input.', reply_markup=reply_markup)
+            except Exception:
+                update.message.reply_text('Preview: photo with poll. Confirm or provide new input.')
+            return
+
+        # Otherwise treat as caption
+        keyboard = [[InlineKeyboardButton("Confirm", callback_data='confirm_caption'),
+                     InlineKeyboardButton("New Input", callback_data='new_input')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        logger.info('handle_caption_poll: sending photo preview with caption')
+        try:
+            context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=user_input)
+        except Exception as e:
+            logger.exception('handle_caption_poll: failed to send photo preview with caption: %s', e)
+        context.user_data['caption'] = user_input
+        try:
+            context.bot.send_message(chat_id=update.effective_chat.id, text='Preview: photo caption. Confirm or provide new input.', reply_markup=reply_markup)
+        except Exception:
+            update.message.reply_text('Preview: photo caption. Confirm or provide new input.')
     else:
         update.message.reply_text('No image found. Please send an image first.')
 
 
 def forward_to_owner(update: Update, context: CallbackContext, caption: str = None, poll: list = None) -> None:
-    file_id = context.user_data['image_file_id']
+    # Support forwarding single photo or album to owner for quick usage (not used in album flow primarily)
+    # Try album first
+    if 'image_file_ids' in context.user_data:
+        file_ids = context.user_data['image_file_ids']
+        logger.info('forward_to_owner: sending album to owner=%s file_count=%d caption=%s poll=%s', OWNER_CHAT_ID, len(file_ids), bool(caption), bool(poll))
+        media = []
+        for i, fid in enumerate(file_ids):
+            if i == 0 and caption:
+                media.append(InputMediaPhoto(media=fid, caption=caption))
+            else:
+                media.append(InputMediaPhoto(media=fid))
+        try:
+            context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+        except Exception as e:
+            logger.exception('forward_to_owner: failed to send media_group: %s', e)
+        keyboard = [[InlineKeyboardButton("Approve", callback_data='approve'),
+                     InlineKeyboardButton("Disapprove", callback_data='disapprove')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+        return
+
+    # Fallback to single photo
+    file_id = context.user_data.get('image_file_id')
     logger.info('forward_to_owner: sending to owner=%s file_id=%s caption=%s poll=%s', OWNER_CHAT_ID, file_id, bool(caption), bool(poll))
     if caption:
         keyboard = [[InlineKeyboardButton("Approve", callback_data='approve'),
@@ -528,7 +664,10 @@ def main() -> None:
 
     # on non-command i.e message - echo the message on Telegram
     dispatcher.add_handler(MessageHandler(Filters.photo, handle_image))
+    # Text messages that are not commands still go to handle_caption_poll
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_caption_poll))
+    # Also explicitly handle /poll commands (commands are filtered out by the above handler)
+    dispatcher.add_handler(CommandHandler('poll', handle_caption_poll))
     dispatcher.add_handler(CallbackQueryHandler(button))
 
     # Start the Bot
