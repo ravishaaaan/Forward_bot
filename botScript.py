@@ -125,7 +125,7 @@ def safe_edit_or_reply(query, text: str):
 # Define a command handler. This usually takes the two arguments update and context.
 def start(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER start: user=%s', update.effective_user and update.effective_user.id)
-    update.message.reply_text('Hi! Send me an image and I will forward it to the channel.')
+    update.message.reply_text('Hi! Send me images and I will forward it to the channel.')
 
 def handle_image(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER handle_image: called by user=%s', update.effective_user and update.effective_user.id)
