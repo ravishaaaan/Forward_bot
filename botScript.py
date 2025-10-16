@@ -7,13 +7,20 @@ except Exception:
     # dotenv not installed; we'll still allow reading os.environ
     load_dotenv = None
 
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackContext, CallbackQueryHandler, Filters
 from telegram import error as tg_error
 from uuid import uuid4
+import threading
 
-# In-memory store for pending approvals: approval_id -> {file_id, caption, poll}
+# In-memory store for pending approvals: approval_id -> {file_ids, caption, poll}
 APPROVALS = {}
+
+# Temporary buffer for incoming media groups (albums). Keyed by (chat_id, media_group_id)
+# Each value: {'items': [{'file_id': str, 'caption': str or None}], 'timer': threading.Timer}
+MEDIA_GROUPS = {}
+# How long (seconds) to wait after the last media_group message before processing the group
+MEDIA_GROUP_WAIT = 0.8
 
 # Enable logging
 logging.basicConfig(
@@ -96,6 +103,12 @@ def handle_image(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER handle_image: called by user=%s', update.effective_user and update.effective_user.id)
     # Check if the message contains a photo
     if update.message and update.message.photo:
+        # If this photo is part of a media group (album), buffer it until the group is complete
+        media_group_id = getattr(update.message, 'media_group_id', None)
+        if media_group_id:
+            logger.info('handle_image: photo belongs to media_group_id=%s', media_group_id)
+            _buffer_media_group(update, context)
+            return
         # Get the file ID of the photo
         file_id = update.message.photo[-1].file_id
         logger.info('handle_image: got file_id=%s', file_id)
@@ -112,6 +125,126 @@ def handle_image(update: Update, context: CallbackContext) -> None:
         logger.info('handle_image: no photo in message')
         update.message.reply_text('Please send a photo.')
 
+
+def _buffer_media_group(update: Update, context: CallbackContext) -> None:
+    """Buffer an incoming media_group (album) message and schedule processing after a short delay.
+
+    Telegram sends album items as separate messages sharing the same media_group_id. We collect them
+    briefly and then process the album as a single approval item.
+    """
+    msg = update.message
+    chat_id = update.effective_chat.id
+    mgid = msg.media_group_id
+    key = (chat_id, mgid)
+
+    file_id = msg.photo[-1].file_id
+    caption = msg.caption if getattr(msg, 'caption', None) else None
+
+    entry = MEDIA_GROUPS.get(key)
+    if not entry:
+        entry = {'items': [], 'timer': None, 'user_id': update.effective_user and update.effective_user.id}
+        MEDIA_GROUPS[key] = entry
+
+    entry['items'].append({'file_id': file_id, 'caption': caption})
+    logger.info('Buffered media_group %s: now %d items', mgid, len(entry['items']))
+
+    # Cancel previous timer (if any) and start a new one. When the timer fires we assume the album is complete.
+    if entry.get('timer'):
+        try:
+            entry['timer'].cancel()
+        except Exception:
+            pass
+
+    timer = threading.Timer(MEDIA_GROUP_WAIT, _process_media_group, args=(chat_id, mgid, context))
+    entry['timer'] = timer
+    timer.daemon = True
+    timer.start()
+
+
+def _process_media_group(chat_id: int, media_group_id: str, context: CallbackContext) -> None:
+    """Called when a buffered media_group should be processed as a single album approval."""
+    key = (chat_id, media_group_id)
+    entry = MEDIA_GROUPS.pop(key, None)
+    if not entry:
+        return
+
+    items = entry.get('items', [])
+    if not items:
+        return
+
+    # Preserve original order
+    file_ids = [it['file_id'] for it in items]
+    # Try to find a non-empty caption from the album (commonly only one item has caption)
+    caption = None
+    for it in items:
+        if it.get('caption'):
+            caption = it['caption']
+            break
+
+    logger.info('Processing media_group %s from chat %s with %d items (caption=%s)', media_group_id, chat_id, len(file_ids), bool(caption))
+
+    # Instead of auto-approving, set pending album into the user's context so they can add caption/poll.
+    # We try to look up the user's context via the provided CallbackContext. The MEDIA_GROUPS entry saved user_id.
+    user_id = entry.get('user_id')
+    try:
+        # context.user_data is keyed by user id inside the CallbackContext; set album info there
+        if user_id:
+            udata = context.dispatcher.user_data.get(user_id, {})
+            udata['image_file_ids'] = file_ids
+            if caption:
+                udata['caption'] = caption
+            # store back (dispatcher.user_data supports mutation in place)
+            context.dispatcher.user_data[user_id] = udata
+            logger.info('Stored album in user_data for user=%s items=%d', user_id, len(file_ids))
+
+            # Send preview of the album back to the sender
+            media = []
+            for i, fid in enumerate(file_ids):
+                if i == 0 and caption:
+                    media.append(InputMediaPhoto(media=fid, caption=caption))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            try:
+                context.bot.send_media_group(chat_id=chat_id, media=media)
+            except Exception as e:
+                logger.exception('Failed to send media_group preview to user: %s', e)
+
+            # Ask the user if they want to add caption/poll (Yes -> add_caption_poll, No -> no_caption_poll)
+            keyboard = [[InlineKeyboardButton("Yes", callback_data='add_caption_poll')],
+                        [InlineKeyboardButton("No", callback_data='no_caption_poll')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                context.bot.send_message(chat_id=chat_id, text='Album received. Do you need to add a caption or poll to it?', reply_markup=reply_markup)
+            except Exception as e:
+                logger.exception('Failed to send album action keyboard to user: %s', e)
+            return
+    except Exception:
+        logger.exception('Failed to store album in user_data; falling back to immediate owner send')
+
+    # Fallback: Create approval entry for the album and send to owner immediately
+    approval_id = str(uuid4())
+    APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': caption, 'poll': None}
+
+    media = []
+    for i, fid in enumerate(file_ids):
+        if i == 0 and caption:
+            media.append(InputMediaPhoto(media=fid, caption=caption))
+        else:
+            media.append(InputMediaPhoto(media=fid))
+
+    try:
+        context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+    except Exception as e:
+        logger.exception('Failed to send media_group to owner: %s', e)
+
+    keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
+                 InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    try:
+        context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+    except Exception as e:
+        logger.exception('Failed to send approval keyboard for media_group: %s', e)
+
 def button(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
     query.answer()
@@ -127,9 +260,27 @@ def button(update: Update, context: CallbackContext) -> None:
     if data == 'no_caption_poll':
         logger.info('button: user chose no caption/poll; creating approval and forwarding to owner')
         # Create approval entry from current user's context
+        # Check for album first
+        file_ids = context.user_data.get('image_file_ids')
+        if file_ids:
+            approval_id = str(uuid4())
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': None, 'poll': None}
+            # send album to owner
+            media = [InputMediaPhoto(media=fid) for fid in file_ids]
+            try:
+                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+            except Exception as e:
+                logger.exception('Failed to send media_group to owner: %s', e)
+            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            safe_edit_or_reply(query, "Album forwarded to the channel for approval.")
+            return
+
         file_id = context.user_data.get('image_file_id')
         if not file_id:
-            logger.warning('no image_file_id in user_data when creating approval')
+            logger.warning('no image_file_id or image_file_ids in user_data when creating approval')
             safe_edit_or_reply(query, 'No image found to forward for approval.')
             return
         approval_id = str(uuid4())
@@ -145,6 +296,30 @@ def button(update: Update, context: CallbackContext) -> None:
     # Confirmation and approval flows
     if data == 'confirm_caption':
         logger.info('button: received confirm_caption')
+        # Support album with caption
+        if 'image_file_ids' in context.user_data and 'caption' in context.user_data:
+            file_ids = context.user_data['image_file_ids']
+            caption = context.user_data['caption']
+            logger.info('button: confirm_caption creating approval entry for album and forwarding to owner')
+            approval_id = str(uuid4())
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': caption, 'poll': None}
+            media = []
+            for i, fid in enumerate(file_ids):
+                if i == 0:
+                    media.append(InputMediaPhoto(media=fid, caption=caption))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            try:
+                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+            except Exception as e:
+                logger.exception('Failed to send media_group to owner: %s', e)
+            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            safe_edit_or_reply(query, "Album with caption forwarded to the channel for approval.")
+            return
+
         if 'image_file_id' in context.user_data and 'caption' in context.user_data:
             file_id = context.user_data['image_file_id']
             caption = context.user_data['caption']
@@ -160,6 +335,31 @@ def button(update: Update, context: CallbackContext) -> None:
 
     if data == 'confirm_poll':
         logger.info('button: received confirm_poll')
+        # Support poll for albums
+        if 'image_file_ids' in context.user_data and 'poll_options' in context.user_data:
+            file_ids = context.user_data['image_file_ids']
+            poll_question = context.user_data.get('poll_question', 'Poll Question')
+            poll_options = context.user_data['poll_options']
+            logger.info('button: confirm_poll creating approval entry for album and forwarding to owner')
+            approval_id = str(uuid4())
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': poll_question, 'poll': poll_options}
+            media = []
+            for i, fid in enumerate(file_ids):
+                if i == 0:
+                    media.append(InputMediaPhoto(media=fid, caption=poll_question))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            try:
+                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+            except Exception as e:
+                logger.exception('Failed to send media_group to owner: %s', e)
+            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album (poll)', reply_markup=reply_markup)
+            safe_edit_or_reply(query, "Album with poll forwarded to the channel for approval.")
+            return
+
         if 'image_file_id' in context.user_data and 'poll_options' in context.user_data:
             file_id = context.user_data['image_file_id']
             poll_question = context.user_data.get('poll_question', 'Poll Question')
@@ -195,6 +395,15 @@ def button(update: Update, context: CallbackContext) -> None:
         if not approval:
             safe_edit_or_reply(query, 'Approval item not found or already processed.')
             return
+        # If it's an album approval
+        file_ids = approval.get('file_ids')
+        if file_ids:
+            caption = approval.get('caption')
+            poll = approval.get('poll')
+            forward_to_channel(context, file_ids, caption, caption if poll else None, poll)
+            safe_edit_or_reply(query, 'Album approved and forwarded to the channel.')
+            return
+
         file_id = approval.get('file_id')
         caption = approval.get('caption')
         poll = approval.get('poll')
@@ -258,12 +467,52 @@ def forward_to_owner(update: Update, context: CallbackContext, caption: str = No
         reply_markup = InlineKeyboardMarkup(keyboard)
         context.bot.send_poll(chat_id=OWNER_CHAT_ID, question=poll_question, options=poll_options, photo=file_id, reply_markup=reply_markup)
 
-def forward_to_channel(context: CallbackContext, file_id: str, caption: str = None, poll_question: str = None, poll_options: list = None) -> None:
-    logger.info('forward_to_channel: sending to channel=%s file_id=%s caption=%s poll_question=%s', CHANNEL_ID, file_id, bool(caption), poll_question)
-    if caption:
+def forward_to_channel(context: CallbackContext, file_id_or_list, caption: str = None, poll_question: str = None, poll_options: list = None) -> None:
+    """Forward single photo or album to the channel.
+
+    file_id_or_list may be a single file_id (str) or a list of file_ids for albums.
+    If poll_question and poll_options are provided, a poll will be sent after the media.
+    """
+    is_album = isinstance(file_id_or_list, (list, tuple))
+    logger.info('forward_to_channel: sending to channel=%s is_album=%s caption=%s poll_question=%s', CHANNEL_ID, is_album, bool(caption), poll_question)
+    if is_album:
+        file_ids = list(file_id_or_list)
+        media = []
+        for i, fid in enumerate(file_ids):
+            if i == 0 and caption:
+                media.append(InputMediaPhoto(media=fid, caption=caption))
+            else:
+                media.append(InputMediaPhoto(media=fid))
+        try:
+            context.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+        except Exception as e:
+            logger.exception('forward_to_channel: failed to send media_group: %s', e)
+        # If there's a poll, send it after the album
+        if poll_question and poll_options:
+            try:
+                context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
+            except Exception as e:
+                logger.exception('forward_to_channel: failed to send poll for album: %s', e)
+        return
+
+    # Single photo path
+    file_id = file_id_or_list
+    if poll_question and poll_options:
+        try:
+            context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=caption)
+        except Exception as e:
+            logger.exception('forward_to_channel: failed to send photo before poll: %s', e)
+        try:
+            context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options)
+        except Exception as e:
+            logger.exception('forward_to_channel: failed to send poll: %s', e)
+        return
+
+    # Simple single photo with optional caption
+    try:
         context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=caption)
-    elif poll_question and poll_options:
-        context.bot.send_poll(chat_id=CHANNEL_ID, question=poll_question, options=poll_options, photo=file_id)
+    except Exception as e:
+        logger.exception('forward_to_channel: failed to send photo: %s', e)
 
 def main() -> None:
     # Validate config and create the Updater using the token from the environment
