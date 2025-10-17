@@ -396,7 +396,8 @@ def button(update: Update, context: CallbackContext) -> None:
             submitter = _resolve_submitter(context, user_id)
             APPROVALS[approval_id] = {'file_id': file_id, 'caption': caption, 'poll': None, 'submitter': submitter}
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{caption}\n\n{submit_text}', reply_markup=reply_markup)
@@ -448,6 +449,7 @@ def button(update: Update, context: CallbackContext) -> None:
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
                         [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{poll_question}\n\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
@@ -833,8 +835,10 @@ def forward_to_owner(update: Update, context: CallbackContext, caption: str = No
             context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
         except Exception as e:
             logger.exception('forward_to_owner: failed to send media_group: %s', e)
+        submitter = _resolve_submitter(context, update.effective_user and update.effective_user.id)
         keyboard = [[InlineKeyboardButton("Approve", callback_data='approve'),
-                     InlineKeyboardButton("Disapprove", callback_data='disapprove')]]
+                     InlineKeyboardButton("Disapprove", callback_data='disapprove')],
+                    [InlineKeyboardButton("Reply", callback_data=f'reply_post:temp'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
         return
@@ -843,8 +847,10 @@ def forward_to_owner(update: Update, context: CallbackContext, caption: str = No
     file_id = context.user_data.get('image_file_id')
     logger.info('forward_to_owner: sending to owner=%s file_id=%s caption=%s poll=%s', OWNER_CHAT_ID, file_id, bool(caption), bool(poll))
     if caption:
+        submitter = _resolve_submitter(context, update.effective_user and update.effective_user.id)
         keyboard = [[InlineKeyboardButton("Approve", callback_data='approve'),
-                     InlineKeyboardButton("Disapprove", callback_data='disapprove')]]
+                     InlineKeyboardButton("Disapprove", callback_data='disapprove')],
+                    [InlineKeyboardButton("Reply", callback_data=f'reply_post:temp'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=caption, reply_markup=reply_markup)
     elif poll:
@@ -935,7 +941,8 @@ def main() -> None:
     dispatcher.add_handler(MessageHandler(Filters.photo, handle_image))
     # Relay messages for contact sessions (owner<->submitter) - must come before caption handler
     # Do NOT match commands here (so /cancel and other commands are handled by CommandHandler)
-    dispatcher.add_handler(MessageHandler((Filters.text & ~Filters.command) | Filters.photo, relay_messages))
+    # Register relay_messages in group=1 so caption handler (group=0) runs first and is not blocked
+    dispatcher.add_handler(MessageHandler((Filters.text & ~Filters.command) | Filters.photo, relay_messages), group=1)
     # Text messages that are not commands still go to handle_caption_poll
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_caption_poll))
     # Also explicitly handle /poll commands (commands are filtered out by the above handler)
