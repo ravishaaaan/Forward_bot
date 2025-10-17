@@ -137,6 +137,98 @@ def safe_edit_or_reply(query, text: str):
     except Exception as e:
         logger.exception('safe_edit_or_reply unexpected error: %s', e)
 
+
+def _send_approval_to_owner(context: CallbackContext, approval_id: str):
+    """Try to send the approval item to the OWNER_CHAT_ID.
+
+    Returns:
+      'ok' on success,
+      'privacy' if blocked by user's privacy settings (Button_user_privacy_restricted),
+      'error' for other failures.
+    """
+    approval = APPROVALS.get(approval_id)
+    if not approval:
+        logger.warning('_send_approval_to_owner: approval %s not found', approval_id)
+        return 'error'
+
+    try:
+        # Album
+        if approval.get('file_ids'):
+            file_ids = approval.get('file_ids')
+            caption = approval.get('caption')
+            media = []
+            for i, fid in enumerate(file_ids):
+                if i == 0 and caption:
+                    media.append(InputMediaPhoto(media=fid, caption=caption))
+                else:
+                    media.append(InputMediaPhoto(media=fid))
+            try:
+                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
+            except tg_error.BadRequest as e:
+                msg = str(e)
+                logger.warning('_send_approval_to_owner: BadRequest when sending media_group: %s', msg)
+                if 'Button_user_privacy_restricted' in msg or 'privacy' in msg.lower():
+                    return 'privacy'
+                return 'error'
+            except Exception as e:
+                logger.exception('_send_approval_to_owner: failed to send media_group: %s', e)
+                return 'error'
+
+            # send approval keyboard/message
+            submitter = approval.get('submitter') or {}
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter and submitter.get('username') else ''}"
+            # Use one button per row so button width follows the text
+            keyboard = [
+                [InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}')],
+                [InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}')],
+                [InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
+            except tg_error.BadRequest as e:
+                msg = str(e)
+                logger.warning('_send_approval_to_owner: BadRequest when sending approval keyboard: %s', msg)
+                if 'Button_user_privacy_restricted' in msg or 'privacy' in msg.lower():
+                    return 'privacy'
+                return 'error'
+            except Exception as e:
+                logger.exception('_send_approval_to_owner: failed to send approval keyboard: %s', e)
+                return 'error'
+
+            return 'ok'
+
+        # Single photo path
+        file_id = approval.get('file_id')
+        caption = approval.get('caption')
+        submitter = approval.get('submitter') or {}
+        submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter and submitter.get('username') else ''}"
+        # One button per row so the client sizes buttons to their text
+        keyboard = [
+            [InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}')],
+            [InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+            [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}')],
+            [InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{caption + "\n\n" if caption else ""}{submit_text}', reply_markup=reply_markup)
+        except tg_error.BadRequest as e:
+            msg = str(e)
+            logger.warning('_send_approval_to_owner: BadRequest when sending photo: %s', msg)
+            if 'Button_user_privacy_restricted' in msg or 'privacy' in msg.lower():
+                return 'privacy'
+            return 'error'
+        except Exception as e:
+            logger.exception('_send_approval_to_owner: failed to send photo: %s', e)
+            return 'error'
+
+        return 'ok'
+    except Exception as e:
+        logger.exception('_send_approval_to_owner: unexpected error: %s', e)
+        return 'error'
+
 # Define a command handler. This usually takes the two arguments update and context.
 def start(update: Update, context: CallbackContext) -> None:
     logger.info('HANDLER start: user=%s', update.effective_user and update.effective_user.id)
@@ -301,6 +393,55 @@ def button(update: Update, context: CallbackContext) -> None:
     data = query.data
     user_id = update.effective_user and update.effective_user.id
     logger.info('HANDLER button: callback from user=%s data=%s', user_id, data)
+    # Handle privacy retry/cancel actions
+    if data == 'privacy_submit':
+        pending = context.user_data.get('pending_approval_id')
+        if not pending:
+            safe_edit_or_reply(query, 'No pending approval to retry.')
+            return
+        logger.info('button: user chose privacy_submit for pending=%s', pending)
+        result = _send_approval_to_owner(context, pending)
+        if result == 'ok':
+            # clear pending and user_data
+            context.user_data.pop('pending_approval_id', None)
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
+            safe_edit_or_reply(query, 'Thanks — your submission was forwarded to the owner for approval.')
+            return
+        if result == 'privacy':
+            # still privacy blocked — re-send the interactive privacy prompt so the user can Retry or Cancel repeatedly
+            logger.info('button: privacy_submit still blocked for pending=%s', pending)
+            # keep pending_approval_id in user_data so repeated retries are possible
+            context.user_data['pending_approval_id'] = pending
+            keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            safe_edit_or_reply(query, "It looks like your privacy settings still prevent forwarding to admins. Please set 'Forwarding' to Everyone in your Telegram privacy settings, then press Submit. Or press Cancel.")
+            try:
+                # Provide direct guidance and the interactive buttons again
+                query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+            except Exception:
+                pass
+            try:
+                query.message.reply_text('If you fixed it, press Submit below to retry sending.')
+            except Exception:
+                pass
+            try:
+                query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+            except Exception:
+                pass
+            return
+        safe_edit_or_reply(query, 'Failed to forward submission (error). Please try again later.')
+        return
+
+    if data == 'privacy_cancel':
+        pending = context.user_data.pop('pending_approval_id', None)
+        # Clear any stored image/caption state as user chose to cancel
+        for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+            context.user_data.pop(k, None)
+        if pending and APPROVALS.pop(pending, None) is not None:
+            logger.info('button: user cancelled pending approval %s', pending)
+        safe_edit_or_reply(query, 'Submission cancelled. You can send a new image when ready.')
+        return
 
     if data == 'add_caption_poll':
         logger.info('button: user chose to add caption/poll')
@@ -316,23 +457,36 @@ def button(update: Update, context: CallbackContext) -> None:
             approval_id = str(uuid4())
             submitter = _resolve_submitter(context, user_id)
             APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': None, 'poll': None, 'submitter': submitter}
-            # send album to owner
-            media = [InputMediaPhoto(media=fid) for fid in file_ids]
-            try:
-                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
-            except Exception as e:
-                logger.exception('Failed to send media_group to owner: %s', e)
-            # include submitter info and contact button
-            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
-            # clear user_data for this user
-            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-                context.user_data.pop(k, None)
-            safe_edit_or_reply(query, "Album forwarded to the channel for approval.")
+            # Try to send approval via helper which checks for privacy errors
+            result = _send_approval_to_owner(context, approval_id)
+            if result == 'ok':
+                # clear user_data for this user
+                for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                    context.user_data.pop(k, None)
+                safe_edit_or_reply(query, "Album forwarded to the channel for approval.")
+                return
+            if result == 'privacy':
+                # store pending approval id and prompt user to change privacy settings
+                context.user_data['pending_approval_id'] = approval_id
+                keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+                try:
+                    query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+                except Exception:
+                    pass
+                try:
+                    query.message.reply_text('If you fixed it, press Submit below to retry sending.')
+                except Exception:
+                    pass
+                # send interactive buttons
+                try:
+                    query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+                except Exception:
+                    pass
+                return
+            # other errors
+            safe_edit_or_reply(query, 'Failed to forward album for approval (error).')
             return
 
         file_id = context.user_data.get('image_file_id')
@@ -343,16 +497,31 @@ def button(update: Update, context: CallbackContext) -> None:
         approval_id = str(uuid4())
         submitter = _resolve_submitter(context, user_id)
         APPROVALS[approval_id] = {'file_id': file_id, 'caption': None, 'poll': None, 'submitter': submitter}
-        # send to owner
-        submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-        keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                     InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                    [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'Approval request\n{submit_text}', reply_markup=reply_markup)
-        for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-            context.user_data.pop(k, None)
-        safe_edit_or_reply(query, "Image forwarded to the channel for approval.")
+        result = _send_approval_to_owner(context, approval_id)
+        if result == 'ok':
+            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                context.user_data.pop(k, None)
+            safe_edit_or_reply(query, "Image forwarded to the channel for approval.")
+            return
+        if result == 'privacy':
+            context.user_data['pending_approval_id'] = approval_id
+            keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+            try:
+                query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+            except Exception:
+                pass
+            try:
+                query.message.reply_text('If you fixed it, press Submit below to retry sending.')
+            except Exception:
+                pass
+            try:
+                query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+            except Exception:
+                pass
+            return
+        safe_edit_or_reply(query, 'Failed to forward image for approval (error).')
         return
 
     # Confirmation and approval flows
@@ -372,20 +541,28 @@ def button(update: Update, context: CallbackContext) -> None:
                     media.append(InputMediaPhoto(media=fid, caption=caption))
                 else:
                     media.append(InputMediaPhoto(media=fid))
-            try:
-                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
-            except Exception as e:
-                logger.exception('Failed to send media_group to owner: %s', e)
-            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
-            # clear user_data
-            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-                context.user_data.pop(k, None)
-            safe_edit_or_reply(query, "Album with caption forwarded to the channel for approval.")
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': caption, 'poll': None, 'submitter': submitter}
+            result = _send_approval_to_owner(context, approval_id)
+            if result == 'ok':
+                for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                    context.user_data.pop(k, None)
+                safe_edit_or_reply(query, "Album with caption forwarded to the channel for approval.")
+                return
+            if result == 'privacy':
+                context.user_data['pending_approval_id'] = approval_id
+                keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+                try:
+                    query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+                except Exception:
+                    pass
+                try:
+                    query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+                except Exception:
+                    pass
+                return
+            safe_edit_or_reply(query, 'Failed to forward album for approval (error).')
             return
 
         if 'image_file_id' in context.user_data and 'caption' in context.user_data:
@@ -400,10 +577,28 @@ def button(update: Update, context: CallbackContext) -> None:
                         [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{caption}\n\n{submit_text}', reply_markup=reply_markup)
-            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-                context.user_data.pop(k, None)
-            safe_edit_or_reply(query, "Image with caption forwarded to the channel for approval.")
+            APPROVALS[approval_id] = {'file_id': file_id, 'caption': caption, 'poll': None, 'submitter': submitter}
+            result = _send_approval_to_owner(context, approval_id)
+            if result == 'ok':
+                for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                    context.user_data.pop(k, None)
+                safe_edit_or_reply(query, "Image with caption forwarded to the channel for approval.")
+                return
+            if result == 'privacy':
+                context.user_data['pending_approval_id'] = approval_id
+                keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+                try:
+                    query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+                except Exception:
+                    pass
+                try:
+                    query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+                except Exception:
+                    pass
+                return
+            safe_edit_or_reply(query, 'Failed to forward image for approval (error).')
         return
 
     if data == 'confirm_poll':
@@ -423,19 +618,28 @@ def button(update: Update, context: CallbackContext) -> None:
                     media.append(InputMediaPhoto(media=fid, caption=poll_question))
                 else:
                     media.append(InputMediaPhoto(media=fid))
-            try:
-                context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
-            except Exception as e:
-                logger.exception('Failed to send media_group to owner: %s', e)
-            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album (poll)\n{submit_text}', reply_markup=reply_markup)
-            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-                context.user_data.pop(k, None)
-            safe_edit_or_reply(query, "Album with poll forwarded to the channel for approval.")
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
+            result = _send_approval_to_owner(context, approval_id)
+            if result == 'ok':
+                for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                    context.user_data.pop(k, None)
+                safe_edit_or_reply(query, "Album with poll forwarded to the channel for approval.")
+                return
+            if result == 'privacy':
+                context.user_data['pending_approval_id'] = approval_id
+                keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+                try:
+                    query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+                except Exception:
+                    pass
+                try:
+                    query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+                except Exception:
+                    pass
+                return
+            safe_edit_or_reply(query, 'Failed to forward album for approval (error).')
             return
 
         if 'image_file_id' in context.user_data and 'poll_options' in context.user_data:
@@ -446,15 +650,28 @@ def button(update: Update, context: CallbackContext) -> None:
             approval_id = str(uuid4())
             submitter = _resolve_submitter(context, user_id)
             APPROVALS[approval_id] = {'file_id': file_id, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
-            keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
-            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{poll_question}\n\n{submit_text}', reply_markup=reply_markup)
-            for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
-                context.user_data.pop(k, None)
-            safe_edit_or_reply(query, "Image with poll forwarded to the channel for approval.")
+            APPROVALS[approval_id] = {'file_id': file_id, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
+            result = _send_approval_to_owner(context, approval_id)
+            if result == 'ok':
+                for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
+                    context.user_data.pop(k, None)
+                safe_edit_or_reply(query, "Image with poll forwarded to the channel for approval.")
+                return
+            if result == 'privacy':
+                context.user_data['pending_approval_id'] = approval_id
+                keyboard = [[InlineKeyboardButton("Retry", callback_data='privacy_submit')], [InlineKeyboardButton("Cancel", callback_data='privacy_cancel')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                safe_edit_or_reply(query, "It looks like your privacy settings prevent forwarding to admins. Please set 'Forwarding' to Everyone, then press Submit. Or press Cancel.")
+                try:
+                    query.message.reply_text('Open Settings → Privacy and Security → Forwarding and enable forwarding to Everyone.')
+                except Exception:
+                    pass
+                try:
+                    query.message.reply_text(text='Retry or Cancel', reply_markup=reply_markup)
+                except Exception:
+                    pass
+                return
+            safe_edit_or_reply(query, 'Failed to forward image for approval (error).')
         return
 
     if data == 'new_input':
