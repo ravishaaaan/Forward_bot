@@ -325,7 +325,7 @@ def button(update: Update, context: CallbackContext) -> None:
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
+                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
             # clear user_data for this user
@@ -346,7 +346,7 @@ def button(update: Update, context: CallbackContext) -> None:
         submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
         keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                      InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                    [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
+                    [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'Approval request\n{submit_text}', reply_markup=reply_markup)
         for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
@@ -378,7 +378,7 @@ def button(update: Update, context: CallbackContext) -> None:
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
+                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
             # clear user_data
@@ -428,7 +428,7 @@ def button(update: Update, context: CallbackContext) -> None:
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
-                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
+                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album (poll)\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
@@ -445,8 +445,8 @@ def button(update: Update, context: CallbackContext) -> None:
             submitter = _resolve_submitter(context, user_id)
             APPROVALS[approval_id] = {'file_id': file_id, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                        [InlineKeyboardButton("Reply", callback_data=f'reply_post:{approval_id}'), InlineKeyboardButton("Contact submitter", url=f'tg://user?id={submitter.get("id")}')]]
             submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{poll_question}\n\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
@@ -457,6 +457,87 @@ def button(update: Update, context: CallbackContext) -> None:
     if data == 'new_input':
         logger.info('button: received new_input')
         safe_edit_or_reply(query, GUIDE_TEXT)
+        return
+
+    if data and data.startswith('contact_post:'):
+        approval_id = data.split(':', 1)[1]
+        logger.info('button: owner wants to contact submitter for approval_id=%s', approval_id)
+        approval = APPROVALS.get(approval_id)
+        if not approval:
+            safe_edit_or_reply(query, 'Approval item not found or already processed.')
+            return
+        submitter = approval.get('submitter')
+        if not submitter or not submitter.get('id'):
+            safe_edit_or_reply(query, 'Submitter information not available.')
+            return
+        owner_id = user_id
+        submitter_id = submitter.get('id')
+        # Try a test ping to the submitter to verify the bot can message them
+        try:
+            ping_text = 'Admin wants to contact you regarding your submission. Reply to this message to start a chat (the admin will remain anonymous).'
+            context.bot.send_message(chat_id=submitter_id, text=ping_text)
+        except tg_error.Forbidden as e:
+            logger.warning('contact_post: Forbidden when pinging submitter=%s: %s', submitter_id, e)
+            safe_edit_or_reply(query, f'Failed to deliver message to the submitter (they may not have started the bot or have blocked it). You can try contacting them directly: tg://user?id={submitter_id}')
+            return
+        except tg_error.Unauthorized as e:
+            logger.warning('contact_post: Unauthorized when pinging submitter=%s: %s', submitter_id, e)
+            safe_edit_or_reply(query, f'Failed to deliver message to the submitter (bot unauthorized). Fallback: tg://user?id={submitter_id}')
+            return
+        except Exception as e:
+            logger.exception('contact_post: error when pinging submitter=%s: %s', submitter_id, e)
+            safe_edit_or_reply(query, f'Failed to deliver message to submitter (error). You can try tg://user?id={submitter_id}')
+            return
+
+        # Ping succeeded — create the contact session
+        context.user_data['contact_target'] = {'approval_id': approval_id, 'submitter_id': submitter_id}
+        try:
+            sd = context.dispatcher.user_data.get(submitter_id, {})
+            sd['contact_source'] = {'owner_id': owner_id, 'approval_id': approval_id}
+            context.dispatcher.user_data[submitter_id] = sd
+        except Exception:
+            logger.exception('Failed to set contact_source for submitter=%s', submitter_id)
+        # Send a fresh confirmation message so the original approval keyboard remains visible
+        try:
+            context.bot.send_message(chat_id=user_id, text='Contact established — you may now send messages; they will be forwarded anonymously. Send /cancel to end this session.')
+        except Exception:
+            safe_edit_or_reply(query, 'Contact established — you may now send messages; they will be forwarded anonymously. Send /cancel to end this session.')
+        return
+
+    if data and data.startswith('reply_post:'):
+        approval_id = data.split(':', 1)[1]
+        logger.info('button: owner wants to reply to submitter for approval_id=%s', approval_id)
+        approval = APPROVALS.get(approval_id)
+        if not approval:
+            safe_edit_or_reply(query, 'Approval item not found or already processed.')
+            return
+        submitter = approval.get('submitter')
+        if not submitter or not submitter.get('id'):
+            safe_edit_or_reply(query, 'Submitter information not available.')
+            return
+        owner_id = user_id
+        submitter_id = submitter.get('id')
+        # Test ping before establishing reply session
+        try:
+            ping_text = 'Admin replied to your submission. Reply to this message to continue the conversation (admin will remain anonymous).'
+            context.bot.send_message(chat_id=submitter_id, text=ping_text)
+        except Exception as e:
+            logger.exception('reply_post: failed to ping submitter=%s: %s', submitter_id, e)
+            safe_edit_or_reply(query, f'Failed to deliver message to the submitter. Try tg://user?id={submitter_id}')
+            return
+
+        # establish reply session (works same as contact)
+        context.user_data['contact_target'] = {'approval_id': approval_id, 'submitter_id': submitter_id}
+        try:
+            sd = context.dispatcher.user_data.get(submitter_id, {})
+            sd['contact_source'] = {'owner_id': owner_id, 'approval_id': approval_id}
+            context.dispatcher.user_data[submitter_id] = sd
+        except Exception:
+            logger.exception('reply_post: failed to set contact_source for submitter=%s', submitter_id)
+        try:
+            context.bot.send_message(chat_id=user_id, text='Reply session established — send messages; they will be forwarded anonymously. Send /cancel to end.')
+        except Exception:
+            safe_edit_or_reply(query, 'Reply session established — send messages; they will be forwarded anonymously. Send /cancel to end.')
         return
 
     if data == 'approve':
@@ -482,6 +563,14 @@ def button(update: Update, context: CallbackContext) -> None:
             poll = approval.get('poll')
             forward_to_channel(context, file_ids, caption, caption if poll else None, poll)
             safe_edit_or_reply(query, 'Album approved and forwarded to the channel.')
+            # Notify submitter if available
+            if approval:
+                submitter = approval.get('submitter')
+                if submitter and submitter.get('id'):
+                    try:
+                        context.bot.send_message(chat_id=submitter['id'], text='Your submission was approved and forwarded to the channel.')
+                    except Exception:
+                        logger.exception('Failed to notify submitter about approval: %s', submitter)
             return
 
         file_id = approval.get('file_id')
@@ -489,12 +578,28 @@ def button(update: Update, context: CallbackContext) -> None:
         poll = approval.get('poll')
         forward_to_channel(context, file_id, caption, caption if poll else None, poll)
         safe_edit_or_reply(query, 'Message approved and forwarded to the channel.')
+        # Notify submitter if available
+        if approval:
+            submitter = approval.get('submitter')
+            if submitter and submitter.get('id'):
+                try:
+                    context.bot.send_message(chat_id=submitter['id'], text='Your submission was approved and forwarded to the channel.')
+                except Exception:
+                    logger.exception('Failed to notify submitter about approval: %s', submitter)
         return
 
     if data and data.startswith('disapprove:'):
         approval_id = data.split(':', 1)[1]
         logger.info('button: owner disapprove for id=%s', approval_id)
         approval = APPROVALS.pop(approval_id, None)
+        # Notify submitter if available
+        if approval:
+            submitter = approval.get('submitter')
+            if submitter and submitter.get('id'):
+                try:
+                    context.bot.send_message(chat_id=submitter['id'], text='Your submission was disapproved by the admin.')
+                except Exception:
+                    logger.exception('Failed to notify submitter about disapproval: %s', submitter)
         safe_edit_or_reply(query, 'Message disapproved.')
         return
         return
@@ -606,6 +711,109 @@ def handle_caption_poll(update: Update, context: CallbackContext) -> None:
             update.message.reply_text('Preview: photo caption. Confirm or provide new input.')
     else:
         update.message.reply_text('No image found. Please send an image first.')
+
+
+def relay_messages(update: Update, context: CallbackContext) -> None:
+    """Relay messages between owner and submitter while a contact session is active.
+
+    - If an owner has `contact_target` in their user_data, forward their messages to the submitter (anonymously via the bot).
+    - If a submitter has `contact_source` in dispatcher.user_data, forward their messages to the owner (showing their name).
+    """
+    uid = update.effective_user and update.effective_user.id
+    # Owner -> Submitter
+    if uid and context.user_data.get('contact_target'):
+        target = context.user_data['contact_target']
+        submitter_id = target.get('submitter_id')
+        approval_id = target.get('approval_id')
+        # forward text or photo as anonymous relay
+        try:
+            if update.message and update.message.text:
+                context.bot.send_message(chat_id=submitter_id, text=f"Admin message regarding your submission: \n\n{update.message.text}")
+            elif update.message and update.message.photo:
+                # forward photo anonymously by sending file_id
+                fid = update.message.photo[-1].file_id
+                context.bot.send_photo(chat_id=submitter_id, photo=fid, caption='Admin sent a photo regarding your submission')
+        except Exception:
+            logger.exception('relay_messages: failed to send owner->submitter message')
+            # Inform owner that the bot could not reach the submitter (likely they haven't started the bot)
+            try:
+                update.message.reply_text(f"Failed to deliver message to the submitter (id={submitter_id}). They may not have started the bot or blocked it. You can contact them directly: tg://user?id={submitter_id}")
+            except Exception:
+                logger.exception('relay_messages: failed to notify owner about delivery failure')
+        return
+
+    # Submitter -> Owner
+    # Check dispatcher.user_data since submitter might not have session in context.user_data
+    try:
+        sdata = context.dispatcher.user_data.get(uid, {})
+    except Exception:
+        sdata = {}
+    if sdata and sdata.get('contact_source'):
+        target = sdata['contact_source']
+        owner_id = target.get('owner_id')
+        approval_id = target.get('approval_id')
+        try:
+            # prepend submitter name
+            name = update.effective_user.full_name if update.effective_user else str(uid)
+            if update.message and update.message.text:
+                context.bot.send_message(chat_id=owner_id, text=f"Message from {name} regarding submission {approval_id}:\n\n{update.message.text}")
+            elif update.message and update.message.photo:
+                fid = update.message.photo[-1].file_id
+                context.bot.send_photo(chat_id=owner_id, photo=fid, caption=f"Photo from {name} regarding submission {approval_id}")
+        except Exception:
+            logger.exception('relay_messages: failed to send submitter->owner message')
+            # Try to inform the submitter that the owner's inbox may not be reachable
+            try:
+                context.bot.send_message(chat_id=uid, text='Failed to forward your message to the owner. They may have ended the session or blocked the bot.')
+            except Exception:
+                pass
+
+
+def cancel_contact(update: Update, context: CallbackContext) -> None:
+    uid = update.effective_user and update.effective_user.id
+    # If owner cancels a contact session
+    if context.user_data.get('contact_target'):
+        ct = context.user_data.pop('contact_target', None)
+        submitter_id = ct and ct.get('submitter_id')
+        # remove submitter's contact_source and notify them
+        try:
+            sd = context.dispatcher.user_data.get(submitter_id, {})
+            if sd.pop('contact_source', None) is not None:
+                context.dispatcher.user_data[submitter_id] = sd
+            # attempt to inform the submitter that the session ended
+            try:
+                context.bot.send_message(chat_id=submitter_id, text='The admin ended the contact session.')
+            except Exception:
+                # best-effort; ignore failures
+                pass
+        except Exception:
+            logger.exception('cancel_contact: failed to clear submitter contact source')
+        update.message.reply_text('Contact session ended.')
+        return
+    # If submitter cancels their outgoing session
+    try:
+        sdata = context.dispatcher.user_data.get(uid, {})
+        if sdata.get('contact_source'):
+            owner_id = sdata['contact_source'].get('owner_id')
+            sdata.pop('contact_source', None)
+            context.dispatcher.user_data[uid] = sdata
+            # Also clear the owner's contact_target so both sides end
+            try:
+                od = context.dispatcher.user_data.get(owner_id, {})
+                if od.pop('contact_target', None) is not None:
+                    context.dispatcher.user_data[owner_id] = od
+                # notify owner the submitter ended the session
+                try:
+                    context.bot.send_message(chat_id=owner_id, text='The submitter ended the contact session.')
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception('cancel_contact: failed to clear owner contact target')
+            update.message.reply_text('Contact session ended.')
+            return
+    except Exception:
+        logger.exception('cancel_contact: unexpected error')
+
 
 
 def forward_to_owner(update: Update, context: CallbackContext, caption: str = None, poll: list = None) -> None:
@@ -724,10 +932,15 @@ def main() -> None:
 
     # on non-command i.e message - echo the message on Telegram
     dispatcher.add_handler(MessageHandler(Filters.photo, handle_image))
+    # Relay messages for contact sessions (owner<->submitter) - must come before caption handler
+    # Do NOT match commands here (so /cancel and other commands are handled by CommandHandler)
+    dispatcher.add_handler(MessageHandler((Filters.text & ~Filters.command) | Filters.photo, relay_messages))
     # Text messages that are not commands still go to handle_caption_poll
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_caption_poll))
     # Also explicitly handle /poll commands (commands are filtered out by the above handler)
     dispatcher.add_handler(CommandHandler('poll', handle_caption_poll))
+    # Cancel contact session
+    dispatcher.add_handler(CommandHandler('cancel', cancel_contact))
     dispatcher.add_handler(CallbackQueryHandler(button))
 
     # Start the Bot
