@@ -261,7 +261,16 @@ def handle_image(update: Update, context: CallbackContext) -> None:
         logger.info('handle_image: asked user to add caption/poll')
     else:
         logger.info('handle_image: no photo in message')
-        update.message.reply_text('Please send a photo.')
+        # update.message may be None for some update types; fall back to bot.send_message
+        try:
+            if update and getattr(update, 'message', None):
+                update.message.reply_text('Please send a photo.')
+            elif update and getattr(update, 'effective_chat', None):
+                context.bot.send_message(chat_id=update.effective_chat.id, text='Please send a photo.')
+            else:
+                logger.warning('handle_image: cannot determine chat to send fallback message')
+        except Exception:
+            logger.exception('handle_image: failed to send fallback no-photo message')
 
 
 def _buffer_media_group(update: Update, context: CallbackContext) -> None:
