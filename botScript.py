@@ -97,6 +97,20 @@ def parse_poll(text: str):
     return question, options
 
 
+def _resolve_submitter(context: CallbackContext, user_id: int):
+    """Return a small dict with submitter details (id, name, username) where possible."""
+    if not user_id:
+        return {'id': None, 'name': 'Unknown', 'username': None}
+    try:
+        user = context.bot.get_chat(user_id)
+        name = getattr(user, 'full_name', None) or f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        username = getattr(user, 'username', None)
+        return {'id': user_id, 'name': name or str(user_id), 'username': username}
+    except Exception:
+        # Fallback: we at least know the id
+        return {'id': user_id, 'name': str(user_id), 'username': None}
+
+
 def safe_edit_or_reply(query, text: str):
     """Try to edit the callback message text or caption; fall back to replying if edit fails."""
     try:
@@ -137,11 +151,14 @@ def handle_image(update: Update, context: CallbackContext) -> None:
             logger.info('handle_image: photo belongs to media_group_id=%s', media_group_id)
             _buffer_media_group(update, context)
             return
+
         # Get the file ID of the photo
         file_id = update.message.photo[-1].file_id
         logger.info('handle_image: got file_id=%s', file_id)
         # Store the file ID in user data
+        # Also store the original message reference so we can forward it later (for owner to contact)
         context.user_data['image_file_id'] = file_id
+        context.user_data['image_item'] = {'chat_id': update.effective_chat.id, 'message_id': update.message.message_id, 'file_id': file_id}
         logger.info('handle_image: stored image_file_id in user_data')
         # Ask the user if they want to add a caption or poll
         keyboard = [[InlineKeyboardButton("Yes", callback_data='add_caption_poll')],
@@ -167,13 +184,15 @@ def _buffer_media_group(update: Update, context: CallbackContext) -> None:
 
     file_id = msg.photo[-1].file_id
     caption = msg.caption if getattr(msg, 'caption', None) else None
+    message_id = msg.message_id
+    chat_id = update.effective_chat.id
 
     entry = MEDIA_GROUPS.get(key)
     if not entry:
         entry = {'items': [], 'timer': None, 'user_id': update.effective_user and update.effective_user.id}
         MEDIA_GROUPS[key] = entry
 
-    entry['items'].append({'file_id': file_id, 'caption': caption})
+    entry['items'].append({'file_id': file_id, 'caption': caption, 'message_id': message_id, 'chat_id': chat_id})
     logger.info('Buffered media_group %s: now %d items', mgid, len(entry['items']))
 
     # Cancel previous timer (if any) and start a new one. When the timer fires we assume the album is complete.
@@ -218,7 +237,9 @@ def _process_media_group(chat_id: int, media_group_id: str, context: CallbackCon
         # context.user_data is keyed by user id inside the CallbackContext; set album info there
         if user_id:
             udata = context.dispatcher.user_data.get(user_id, {})
+            # store both the file ids and the original message references
             udata['image_file_ids'] = file_ids
+            udata['image_items'] = [{'file_id': it['file_id'], 'chat_id': it.get('chat_id'), 'message_id': it.get('message_id')} for it in items]
             if caption:
                 udata['caption'] = caption
             # store back (dispatcher.user_data supports mutation in place)
@@ -292,17 +313,21 @@ def button(update: Update, context: CallbackContext) -> None:
         file_ids = context.user_data.get('image_file_ids')
         if file_ids:
             approval_id = str(uuid4())
-            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': None, 'poll': None}
+            submitter = _resolve_submitter(context, user_id)
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': None, 'poll': None, 'submitter': submitter}
             # send album to owner
             media = [InputMediaPhoto(media=fid) for fid in file_ids]
             try:
                 context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
             except Exception as e:
                 logger.exception('Failed to send media_group to owner: %s', e)
+            # include submitter info and contact button
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
             # clear user_data for this user
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
                 context.user_data.pop(k, None)
@@ -315,12 +340,15 @@ def button(update: Update, context: CallbackContext) -> None:
             safe_edit_or_reply(query, 'No image found to forward for approval.')
             return
         approval_id = str(uuid4())
-        APPROVALS[approval_id] = {'file_id': file_id, 'caption': None, 'poll': None}
+        submitter = _resolve_submitter(context, user_id)
+        APPROVALS[approval_id] = {'file_id': file_id, 'caption': None, 'poll': None, 'submitter': submitter}
         # send to owner
+        submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
         keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                     InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+                     InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                    [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption='Approval request', reply_markup=reply_markup)
+        context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'Approval request\n{submit_text}', reply_markup=reply_markup)
         for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
             context.user_data.pop(k, None)
         safe_edit_or_reply(query, "Image forwarded to the channel for approval.")
@@ -335,7 +363,8 @@ def button(update: Update, context: CallbackContext) -> None:
             caption = context.user_data['caption']
             logger.info('button: confirm_caption creating approval entry for album and forwarding to owner')
             approval_id = str(uuid4())
-            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': caption, 'poll': None}
+            submitter = _resolve_submitter(context, user_id)
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': caption, 'poll': None, 'submitter': submitter}
             media = []
             for i, fid in enumerate(file_ids):
                 if i == 0:
@@ -346,10 +375,12 @@ def button(update: Update, context: CallbackContext) -> None:
                 context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
             except Exception as e:
                 logger.exception('Failed to send media_group to owner: %s', e)
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album', reply_markup=reply_markup)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album\n{submit_text}', reply_markup=reply_markup)
             # clear user_data
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
                 context.user_data.pop(k, None)
@@ -361,11 +392,13 @@ def button(update: Update, context: CallbackContext) -> None:
             caption = context.user_data['caption']
             logger.info('button: confirm_caption creating approval entry and forwarding to owner')
             approval_id = str(uuid4())
-            APPROVALS[approval_id] = {'file_id': file_id, 'caption': caption, 'poll': None}
+            submitter = _resolve_submitter(context, user_id)
+            APPROVALS[approval_id] = {'file_id': file_id, 'caption': caption, 'poll': None, 'submitter': submitter}
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=caption, reply_markup=reply_markup)
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
+            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{caption}\n\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
                 context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Image with caption forwarded to the channel for approval.")
@@ -380,7 +413,8 @@ def button(update: Update, context: CallbackContext) -> None:
             poll_options = context.user_data['poll_options']
             logger.info('button: confirm_poll creating approval entry for album and forwarding to owner')
             approval_id = str(uuid4())
-            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': poll_question, 'poll': poll_options}
+            submitter = _resolve_submitter(context, user_id)
+            APPROVALS[approval_id] = {'file_ids': file_ids, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
             media = []
             for i, fid in enumerate(file_ids):
                 if i == 0:
@@ -391,10 +425,12 @@ def button(update: Update, context: CallbackContext) -> None:
                 context.bot.send_media_group(chat_id=OWNER_CHAT_ID, media=media)
             except Exception as e:
                 logger.exception('Failed to send media_group to owner: %s', e)
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
-                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
+                         InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')],
+                        [InlineKeyboardButton("Contact submitter", url=f"tg://user?id={submitter['id']}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_message(chat_id=OWNER_CHAT_ID, text='Approval request for album (poll)', reply_markup=reply_markup)
+            context.bot.send_message(chat_id=OWNER_CHAT_ID, text=f'Approval request for album (poll)\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
                 context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Album with poll forwarded to the channel for approval.")
@@ -406,11 +442,13 @@ def button(update: Update, context: CallbackContext) -> None:
             poll_options = context.user_data['poll_options']
             logger.info('button: confirm_poll creating approval entry and forwarding to owner')
             approval_id = str(uuid4())
-            APPROVALS[approval_id] = {'file_id': file_id, 'caption': poll_question, 'poll': poll_options}
+            submitter = _resolve_submitter(context, user_id)
+            APPROVALS[approval_id] = {'file_id': file_id, 'caption': poll_question, 'poll': poll_options, 'submitter': submitter}
             keyboard = [[InlineKeyboardButton("Approve", callback_data=f'approve:{approval_id}'),
                          InlineKeyboardButton("Disapprove", callback_data=f'disapprove:{approval_id}')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=poll_question, reply_markup=reply_markup)
+            submit_text = f"Submitted by: {submitter.get('name')}{(' (@' + submitter['username'] + ')') if submitter.get('username') else ''}"
+            context.bot.send_photo(chat_id=OWNER_CHAT_ID, photo=file_id, caption=f'{poll_question}\n\n{submit_text}', reply_markup=reply_markup)
             for k in ('image_file_ids', 'image_file_id', 'caption', 'poll_options', 'poll_question'):
                 context.user_data.pop(k, None)
             safe_edit_or_reply(query, "Image with poll forwarded to the channel for approval.")
