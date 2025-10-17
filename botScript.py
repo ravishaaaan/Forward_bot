@@ -48,6 +48,7 @@ GUIDE_TEXT = (
     "To create a poll:\n"
     "- Start your message with /poll followed by the question and each option separated by a vertical bar |.\n"
     "- Format: /poll Question|Option 1|Option 2|Option 3\n"
+    "- Format: /poll ඔයාගෙ ප්‍රශ්නය|පළවෙනි පිළිතුර|දෙවෙනි පිළිතුර|තුන්වැනි පිළිතුර|හතරවැනි පිළිතුර\n"
     "- Example: /poll Which color do you prefer?|Red|Blue|Green\n\n"
     "Important:\n"
     "- Polls must have at least 2 options (and up to 10).\n"
