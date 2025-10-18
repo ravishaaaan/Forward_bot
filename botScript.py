@@ -839,6 +839,23 @@ def handle_caption_poll(update: Update, context: CallbackContext) -> None:
     if not update or not getattr(update, 'message', None) or not getattr(update.message, 'text', None):
         logger.warning('handle_caption_poll: no message text found in update; ignoring')
         return
+    
+    # Skip caption/poll handling if a contact/reply session is active
+    # (relay_messages will handle the message in group=1)
+    uid = update.effective_user and update.effective_user.id
+    if uid and context.user_data.get('contact_target'):
+        # Owner is in a reply session with a submitter
+        logger.info('handle_caption_poll: skipping (owner contact session active)')
+        return
+    try:
+        sdata = context.dispatcher.user_data.get(uid, {})
+        if sdata and sdata.get('contact_source'):
+            # Submitter is in a reply session with owner
+            logger.info('handle_caption_poll: skipping (submitter contact session active)')
+            return
+    except Exception:
+        pass
+    
     user_input = update.message.text
     logger.info('handle_caption_poll: user_input=%s', user_input)
     # First check for album in user_data
